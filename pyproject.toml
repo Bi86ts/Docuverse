@@ -1,0 +1,36 @@
+[project]
+name = "closedloop-os"
+version = "0.2.0"
+description = "ClosedLoop OS - unified knowledge intelligence system. Standalone FastAPI + Cosmos DB + Azure OpenAI."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "azure-cosmos>=4.9.0",
+    "apscheduler>=3.11.0",
+    "fastapi>=0.116.0",
+    "httpx>=0.28.1",
+    "mcp[cli]>=1.27.1",
+    "openai>=1.99.0",
+    "pydantic>=2.11.0",
+    "python-dotenv>=1.1.0",
+    "uvicorn[standard]>=0.35.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

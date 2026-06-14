@@ -1,0 +1,539 @@
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from functools import lru_cache
+from typing import Any
+
+from azure.cosmos import CosmosClient
+
+from closedloop_os.config import get_settings
+from closedloop_os.models import CanonicalEvent, EventQuery, GraphRelationship
+
+
+class EventRepository(ABC):
+    @abstractmethod
+    def upsert_event(self, event: CanonicalEvent) -> CanonicalEvent:
+        raise NotImplementedError
+
+    @abstractmethod
+    def query_events(self, query: EventQuery, source_tool: str = "github") -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_event_by_id(self, event_id: str) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def search_decisions(self, query_text: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_slack_context(
+        self,
+        channel: str,
+        thread_ts: str | None = None,
+        user: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_linear_sprint_status(
+        self,
+        project: str | None = None,
+        cycle: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_jira_epic_status(self, epic_key: str | None = None, project: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_notion_decisions(self, query_text: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_latest_timestamp(self, source_tool: str, event_prefix: str | None = None) -> str | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def upsert_relationships(self, relationships: list[GraphRelationship]) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_entity_graph(self, entity: str, limit: int = 50) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_customer_signals(self, limit: int = 25) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_action_items(self, query_text: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def analyze_meeting(self, meeting_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def search_text(self, query_text: str, limit: int = 25, source_tool: str | None = None) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_timeline(self, entity: str, limit: int = 50) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+
+class CosmosEventRepository(EventRepository):
+    def __init__(self) -> None:
+        settings = get_settings()
+        client = CosmosClient(url=settings.cosmos_endpoint, credential=settings.cosmos_key)
+        database = client.get_database_client(settings.cosmos_database_name)
+        self.container = database.get_container_client(settings.cosmos_container_name)
+        self.relationship_container = database.get_container_client("relationships")
+
+    def upsert_event(self, event: CanonicalEvent) -> CanonicalEvent:
+        self.container.upsert_item(event.model_dump(mode="json"))
+        return event
+
+    def query_events(self, query: EventQuery, source_tool: str = "github") -> list[dict[str, Any]]:
+        sql = ["SELECT TOP @limit * FROM c WHERE c.source_tool = @source_tool"]
+        parameters = [
+            {"name": "@limit", "value": query.limit},
+            {"name": "@source_tool", "value": source_tool},
+        ]
+
+        if query.project:
+            sql.append("AND c.project = @project")
+            parameters.append({"name": "@project", "value": query.project})
+        if query.actor:
+            sql.append("AND c.actor = @actor")
+            parameters.append({"name": "@actor", "value": query.actor})
+        if query.event_type:
+            sql.append("AND STARTSWITH(c.event_type, @event_type)")
+            parameters.append({"name": "@event_type", "value": query.event_type})
+
+        sql.append("ORDER BY c.timestamp DESC")
+        items = self.container.query_items(
+            query=" ".join(sql),
+            parameters=parameters,
+            enable_cross_partition_query=True,
+        )
+        return list(items)
+
+    def get_event_by_id(self, event_id: str) -> dict[str, Any] | None:
+        query = self.container.query_items(
+            query="SELECT TOP 1 * FROM c WHERE c.id = @id",
+            parameters=[{"name": "@id", "value": event_id}],
+            enable_cross_partition_query=True,
+        )
+        return next(iter(query), None)
+
+    def search_decisions(self, query_text: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        sql = [
+            "SELECT TOP @limit * FROM c",
+            "WHERE IS_DEFINED(c.metadata.classification.has_decision)",
+            "AND c.metadata.classification.has_decision = true",
+        ]
+        parameters = [{"name": "@limit", "value": limit}]
+        if query_text:
+            sql.append("AND (CONTAINS(LOWER(c.title), @query_text) OR CONTAINS(LOWER(c.description), @query_text))")
+            parameters.append({"name": "@query_text", "value": query_text.lower()})
+        sql.append("ORDER BY c.timestamp DESC")
+        return list(
+            self.container.query_items(
+                query=" ".join(sql),
+                parameters=parameters,
+                enable_cross_partition_query=True,
+            )
+        )
+
+    def get_slack_context(
+        self,
+        channel: str,
+        thread_ts: str | None = None,
+        user: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        sql = ["SELECT TOP @limit * FROM c WHERE c.source_tool = 'slack' AND c.metadata.channel = @channel"]
+        parameters = [{"name": "@limit", "value": limit}, {"name": "@channel", "value": channel}]
+        if thread_ts:
+            sql.append("AND c.metadata.thread_ts = @thread_ts")
+            parameters.append({"name": "@thread_ts", "value": thread_ts})
+        if user:
+            sql.append("AND c.metadata.user = @user")
+            parameters.append({"name": "@user", "value": user})
+        sql.append("ORDER BY c.timestamp DESC")
+        return list(
+            self.container.query_items(
+                query=" ".join(sql),
+                parameters=parameters,
+                enable_cross_partition_query=True,
+            )
+        )
+
+    def get_linear_sprint_status(
+        self,
+        project: str | None = None,
+        cycle: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        sql = ["SELECT TOP @limit * FROM c WHERE c.source_tool = 'linear'"]
+        parameters = [{"name": "@limit", "value": limit}]
+        if project:
+            sql.append("AND c.project = @project")
+            parameters.append({"name": "@project", "value": project})
+        if cycle:
+            sql.append("AND c.metadata.cycle = @cycle")
+            parameters.append({"name": "@cycle", "value": cycle})
+        sql.append("ORDER BY c.timestamp DESC")
+        return list(
+            self.container.query_items(
+                query=" ".join(sql),
+                parameters=parameters,
+                enable_cross_partition_query=True,
+            )
+        )
+
+    def get_jira_epic_status(self, epic_key: str | None = None, project: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        sql = ["SELECT TOP @limit * FROM c WHERE c.source_tool = 'jira'"]
+        parameters = [{"name": "@limit", "value": limit}]
+        if epic_key:
+            sql.append("AND c.metadata.epic_key = @epic_key")
+            parameters.append({"name": "@epic_key", "value": epic_key})
+        if project:
+            sql.append("AND c.project = @project")
+            parameters.append({"name": "@project", "value": project})
+        sql.append("ORDER BY c.timestamp DESC")
+        return list(
+            self.container.query_items(
+                query=" ".join(sql),
+                parameters=parameters,
+                enable_cross_partition_query=True,
+            )
+        )
+
+    def get_notion_decisions(self, query_text: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        sql = [
+            "SELECT TOP @limit * FROM c",
+            "WHERE c.source_tool = 'notion'",
+            "AND IS_DEFINED(c.metadata.classification.has_decision)",
+            "AND c.metadata.classification.has_decision = true",
+        ]
+        parameters = [{"name": "@limit", "value": limit}]
+        if query_text:
+            sql.append("AND (CONTAINS(LOWER(c.title), @query_text) OR CONTAINS(LOWER(c.description), @query_text))")
+            parameters.append({"name": "@query_text", "value": query_text.lower()})
+        sql.append("ORDER BY c.timestamp DESC")
+        return list(
+            self.container.query_items(
+                query=" ".join(sql),
+                parameters=parameters,
+                enable_cross_partition_query=True,
+            )
+        )
+
+    def get_latest_timestamp(self, source_tool: str, event_prefix: str | None = None) -> str | None:
+        sql = ["SELECT TOP 1 c.timestamp FROM c WHERE c.source_tool = @source_tool"]
+        parameters = [{"name": "@source_tool", "value": source_tool}]
+        if event_prefix:
+            sql.append("AND STARTSWITH(c.event_type, @event_prefix)")
+            parameters.append({"name": "@event_prefix", "value": event_prefix})
+        sql.append("ORDER BY c.timestamp DESC")
+        items = list(
+            self.container.query_items(
+                query=" ".join(sql),
+                parameters=parameters,
+                enable_cross_partition_query=True,
+            )
+        )
+        return items[0]["timestamp"] if items else None
+
+    def upsert_relationships(self, relationships: list[GraphRelationship]) -> None:
+        for relationship in relationships:
+            self.relationship_container.upsert_item(relationship.model_dump(mode="json"))
+
+    def get_entity_graph(self, entity: str, limit: int = 50) -> list[dict[str, Any]]:
+        query = """
+        SELECT TOP @limit * FROM c
+        WHERE c.source_node = @entity OR c.target_node = @entity
+        """
+        return list(
+            self.relationship_container.query_items(
+                query=query,
+                parameters=[{"name": "@entity", "value": entity}, {"name": "@limit", "value": limit}],
+                enable_cross_partition_query=True,
+            )
+        )
+
+    def get_customer_signals(self, limit: int = 25) -> list[dict[str, Any]]:
+        query = """
+        SELECT TOP @limit * FROM c
+        WHERE c.source_tool = 'zendesk'
+        ORDER BY c.importance_score DESC, c.timestamp DESC
+        """
+        return list(
+            self.container.query_items(
+                query=query,
+                parameters=[{"name": "@limit", "value": limit}],
+                enable_cross_partition_query=True,
+            )
+        )
+
+    def get_action_items(self, query_text: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        sql = [
+            "SELECT TOP @limit * FROM c",
+            "WHERE IS_DEFINED(c.metadata.classification.action_items)",
+            "AND ARRAY_LENGTH(c.metadata.classification.action_items) > 0",
+        ]
+        parameters = [{"name": "@limit", "value": limit}]
+        if query_text:
+            sql.append("AND (CONTAINS(LOWER(c.title), @query_text) OR CONTAINS(LOWER(c.description), @query_text))")
+            parameters.append({"name": "@query_text", "value": query_text.lower()})
+        sql.append("ORDER BY c.timestamp DESC")
+        return list(
+            self.container.query_items(
+                query=" ".join(sql),
+                parameters=parameters,
+                enable_cross_partition_query=True,
+            )
+        )
+
+    def analyze_meeting(self, meeting_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        query = """
+        SELECT TOP @limit * FROM c
+        WHERE c.source_tool = 'meeting'
+        AND c.metadata.meeting_id = @meeting_id
+        ORDER BY c.timestamp ASC
+        """
+        return list(
+            self.container.query_items(
+                query=query,
+                parameters=[{"name": "@meeting_id", "value": meeting_id}, {"name": "@limit", "value": limit}],
+                enable_cross_partition_query=True,
+            )
+        )
+
+    def search_text(self, query_text: str, limit: int = 25, source_tool: str | None = None) -> list[dict[str, Any]]:
+        sql = ["SELECT TOP @limit * FROM c WHERE (CONTAINS(LOWER(c.title), @query_text) OR CONTAINS(LOWER(c.description), @query_text) OR CONTAINS(LOWER(c.actor), @query_text) OR CONTAINS(LOWER(c.project), @query_text))"]
+        parameters = [{"name": "@limit", "value": limit}, {"name": "@query_text", "value": query_text.lower()}]
+        if source_tool:
+            sql.append("AND c.source_tool = @source_tool")
+            parameters.append({"name": "@source_tool", "value": source_tool})
+        sql.append("ORDER BY c.timestamp DESC")
+        return list(
+            self.container.query_items(
+                query=" ".join(sql),
+                parameters=parameters,
+                enable_cross_partition_query=True,
+            )
+        )
+
+    def get_timeline(self, entity: str, limit: int = 50) -> list[dict[str, Any]]:
+        sql = [
+            "SELECT TOP @limit * FROM c",
+            "WHERE CONTAINS(LOWER(c.title), @entity)",
+            "OR CONTAINS(LOWER(c.description), @entity)",
+            "OR CONTAINS(LOWER(c.actor), @entity)",
+            "OR CONTAINS(LOWER(c.project), @entity)",
+            "ORDER BY c.timestamp ASC",
+        ]
+        return list(
+            self.container.query_items(
+                query=" ".join(sql),
+                parameters=[{"name": "@limit", "value": limit}, {"name": "@entity", "value": entity.lower()}],
+                enable_cross_partition_query=True,
+            )
+        )
+
+
+class InMemoryEventRepository(EventRepository):
+    def __init__(self) -> None:
+        self._events: dict[str, dict[str, Any]] = {}
+        self._relationships: dict[str, dict[str, Any]] = {}
+
+    def upsert_event(self, event: CanonicalEvent) -> CanonicalEvent:
+        self._events[event.id] = event.model_dump(mode="json")
+        return event
+
+    def query_events(self, query: EventQuery, source_tool: str = "github") -> list[dict[str, Any]]:
+        events = [event for event in self._events.values() if event["source_tool"] == source_tool]
+        if query.project:
+            events = [event for event in events if event["project"] == query.project]
+        if query.actor:
+            events = [event for event in events if event["actor"] == query.actor]
+        if query.event_type:
+            events = [event for event in events if event["event_type"].startswith(query.event_type)]
+        events.sort(key=lambda item: item["timestamp"], reverse=True)
+        return events[: query.limit]
+
+    def get_event_by_id(self, event_id: str) -> dict[str, Any] | None:
+        return self._events.get(event_id)
+
+    def search_decisions(self, query_text: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        events = [
+            event
+            for event in self._events.values()
+            if event.get("metadata", {}).get("classification", {}).get("has_decision") is True
+        ]
+        if query_text:
+            needle = query_text.lower()
+            events = [
+                event
+                for event in events
+                if needle in event.get("title", "").lower() or needle in event.get("description", "").lower()
+            ]
+        events.sort(key=lambda item: item["timestamp"], reverse=True)
+        return events[:limit]
+
+    def get_slack_context(
+        self,
+        channel: str,
+        thread_ts: str | None = None,
+        user: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        events = [
+            event
+            for event in self._events.values()
+            if event.get("source_tool") == "slack" and event.get("metadata", {}).get("channel") == channel
+        ]
+        if thread_ts:
+            events = [event for event in events if event.get("metadata", {}).get("thread_ts") == thread_ts]
+        if user:
+            events = [event for event in events if event.get("metadata", {}).get("user") == user]
+        events.sort(key=lambda item: item["timestamp"], reverse=True)
+        return events[:limit]
+
+    def get_linear_sprint_status(
+        self,
+        project: str | None = None,
+        cycle: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        events = [event for event in self._events.values() if event.get("source_tool") == "linear"]
+        if project:
+            events = [event for event in events if event.get("project") == project]
+        if cycle:
+            events = [event for event in events if event.get("metadata", {}).get("cycle") == cycle]
+        events.sort(key=lambda item: item["timestamp"], reverse=True)
+        return events[:limit]
+
+    def get_jira_epic_status(self, epic_key: str | None = None, project: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        events = [event for event in self._events.values() if event.get("source_tool") == "jira"]
+        if epic_key:
+            events = [event for event in events if event.get("metadata", {}).get("epic_key") == epic_key]
+        if project:
+            events = [event for event in events if event.get("project") == project]
+        events.sort(key=lambda item: item["timestamp"], reverse=True)
+        return events[:limit]
+
+    def get_notion_decisions(self, query_text: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        events = [
+            event
+            for event in self._events.values()
+            if event.get("source_tool") == "notion"
+            and event.get("metadata", {}).get("classification", {}).get("has_decision") is True
+        ]
+        if query_text:
+            needle = query_text.lower()
+            events = [
+                event
+                for event in events
+                if needle in event.get("title", "").lower() or needle in event.get("description", "").lower()
+            ]
+        events.sort(key=lambda item: item["timestamp"], reverse=True)
+        return events[:limit]
+
+    def get_latest_timestamp(self, source_tool: str, event_prefix: str | None = None) -> str | None:
+        events = [event for event in self._events.values() if event.get("source_tool") == source_tool]
+        if event_prefix:
+            events = [event for event in events if event.get("event_type", "").startswith(event_prefix)]
+        events.sort(key=lambda item: item["timestamp"], reverse=True)
+        return events[0]["timestamp"] if events else None
+
+    def upsert_relationships(self, relationships: list[GraphRelationship]) -> None:
+        for relationship in relationships:
+            self._relationships[relationship.id] = relationship.model_dump(mode="json")
+
+    def get_entity_graph(self, entity: str, limit: int = 50) -> list[dict[str, Any]]:
+        matches = [
+            relationship
+            for relationship in self._relationships.values()
+            if relationship.get("source_node") == entity or relationship.get("target_node") == entity
+        ]
+        return matches[:limit]
+
+    def get_customer_signals(self, limit: int = 25) -> list[dict[str, Any]]:
+        events = [event for event in self._events.values() if event.get("source_tool") == "zendesk"]
+        events.sort(key=lambda item: (item["importance_score"], item["timestamp"]), reverse=True)
+        return events[:limit]
+
+    def get_action_items(self, query_text: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        events = [
+            event
+            for event in self._events.values()
+            if event.get("metadata", {}).get("classification", {}).get("action_items")
+        ]
+        if query_text:
+            needle = query_text.lower()
+            events = [
+                event
+                for event in events
+                if needle in event.get("title", "").lower() or needle in event.get("description", "").lower()
+            ]
+        events.sort(key=lambda item: item["timestamp"], reverse=True)
+        return events[:limit]
+
+    def analyze_meeting(self, meeting_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        events = [
+            event
+            for event in self._events.values()
+            if event.get("source_tool") == "meeting" and event.get("metadata", {}).get("meeting_id") == meeting_id
+        ]
+        events.sort(key=lambda item: item["timestamp"])
+        return events[:limit]
+
+    def search_text(self, query_text: str, limit: int = 25, source_tool: str | None = None) -> list[dict[str, Any]]:
+        needle = query_text.lower()
+        events = list(self._events.values())
+        if source_tool:
+            events = [event for event in events if event.get("source_tool") == source_tool]
+        events = [
+            event
+            for event in events
+            if needle in event.get("title", "").lower()
+            or needle in event.get("description", "").lower()
+            or needle in event.get("actor", "").lower()
+            or needle in event.get("project", "").lower()
+        ]
+        events.sort(key=lambda item: item["timestamp"], reverse=True)
+        return events[:limit]
+
+    def get_timeline(self, entity: str, limit: int = 50) -> list[dict[str, Any]]:
+        needle = entity.lower()
+        events = [
+            event
+            for event in self._events.values()
+            if needle in event.get("title", "").lower()
+            or needle in event.get("description", "").lower()
+            or needle in event.get("actor", "").lower()
+            or needle in event.get("project", "").lower()
+        ]
+        events.sort(key=lambda item: item["timestamp"])
+        return events[:limit]
+
+
+@lru_cache(maxsize=1)
+def get_local_repository() -> InMemoryEventRepository:
+    return InMemoryEventRepository()
+
+
+def build_repository() -> EventRepository:
+    settings = get_settings()
+    if settings.has_cosmos:
+        return CosmosEventRepository()
+    return get_local_repository()

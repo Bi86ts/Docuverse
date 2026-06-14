@@ -1,0 +1,340 @@
+Metadata-Version: 2.4
+Name: closedloop-os
+Version: 0.2.0
+Summary: ClosedLoop OS - unified knowledge intelligence system. Standalone FastAPI + Cosmos DB + Azure OpenAI.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: azure-cosmos>=4.9.0
+Requires-Dist: apscheduler>=3.11.0
+Requires-Dist: fastapi>=0.116.0
+Requires-Dist: httpx>=0.28.1
+Requires-Dist: mcp[cli]>=1.27.1
+Requires-Dist: openai>=1.99.0
+Requires-Dist: pydantic>=2.11.0
+Requires-Dist: python-dotenv>=1.1.0
+Requires-Dist: uvicorn[standard]>=0.35.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.4.0; extra == "dev"
+
+# Intellihub / ClosedLoop OS
+
+ClosedLoop OS is a knowledge intelligence backend for product and engineering teams. It connects tools like GitHub, Slack, Linear, Jira, Confluence, Notion, Zendesk, and meeting transcripts, then turns noisy activity into normalized, searchable, cited intelligence.
+
+The project runs as a standalone **FastAPI + Uvicorn** server with **Azure Cosmos DB** for persistence and **Azure OpenAI** for classification and embeddings. No Azure Functions, Service Bus, AI Search, or Key Vault are needed.
+
+## The Problem
+
+Modern teams make decisions everywhere:
+
+- GitHub has code activity and pull requests.
+- Slack has discussions, blockers, and informal decisions.
+- Linear and Jira have delivery status.
+- Confluence and Notion have docs and decision records.
+- Zendesk has customer pain and escalation signals.
+- Meetings contain action items and context that often disappears.
+
+The result is fragmented knowledge. People waste time asking:
+
+- What happened with this feature?
+- Why did we make this decision?
+- Is this Jira issue duplicated in Linear?
+- Which customer signals mention this engineering work?
+- What action items came from the last meeting?
+- What evidence supports this answer?
+
+ClosedLoop OS solves this by creating a unified event intelligence layer across tools.
+
+## What We Built
+
+- Webhook ingestion for GitHub, Slack, Linear, Jira, Confluence, and Zendesk.
+- Notion polling support through APScheduler background jobs.
+- Meeting transcript upload for `.txt`, `.vtt`, `.srt`, and `.json`.
+- Canonical event normalization across all sources.
+- Cosmos DB persistence for events, relationships, and search vectors.
+- Azure OpenAI classification and embedding support.
+- In-memory vector search with Cosmos DB-backed persistence (replaces Azure AI Search).
+- Graph relationship extraction for blockers, decisions, assignments, mentions, causes, resolutions, and meeting discussions.
+- MCP tools for querying events, search, timelines, entity graphs, customer signals, and cited intelligence answers.
+- Heuristic fallback behavior so the app can run and test before Azure OpenAI is configured.
+
+## How It Works
+
+1. A connector receives a webhook, uploaded transcript, or scheduled sync result.
+2. The app converts the raw payload into a normalized canonical event.
+3. Events are processed immediately by the in-process classification pipeline (no message queue needed).
+4. Azure OpenAI classifies important events and extracts useful metadata (heuristic fallback when not configured).
+5. Events are stored in Cosmos DB, or in memory when Cosmos DB is not configured.
+6. Searchable content is embedded and stored in a Cosmos DB `knowledge` container, with in-memory cosine similarity search.
+7. Intelligence APIs and MCP tools retrieve evidence, build answers, attach citations, and expose timelines or relationship graphs.
+
+## Architecture
+
+Important entry points:
+
+- [main.py](main.py): standalone Uvicorn ASGI app runner.
+- [src/closedloop_os/api.py](src/closedloop_os/api.py): FastAPI routes + APScheduler lifespan.
+- [src/closedloop_os/pipeline.py](src/closedloop_os/pipeline.py): classification and processing pipeline.
+- [src/closedloop_os/search.py](src/closedloop_os/search.py): semantic search backends (CosmosAware + InMemory).
+- [src/closedloop_os/intelligence.py](src/closedloop_os/intelligence.py): cited answer generation.
+- [src/closedloop_os/mcp_server.py](src/closedloop_os/mcp_server.py): MCP tool surface.
+
+HTTP endpoints:
+
+- `GET /healthz`
+- `POST /api/connectors/github`
+- `POST /api/connectors/slack`
+- `POST /api/connectors/linear`
+- `POST /api/connectors/jira`
+- `POST /api/connectors/confluence`
+- `POST /api/connectors/zendesk`
+- `POST /api/connectors/meetings/upload`
+- `/mcp`
+
+## Canonical Event Schema
+
+All connectors normalize into the same event shape:
+
+```json
+{
+  "id": "uuid",
+  "source_tool": "github",
+  "event_type": "github.pull_request.opened",
+  "title": "PR opened: Add webhook flow",
+  "description": "Normalized event description",
+  "actor": "octocat",
+  "project": "org/repo",
+  "importance_score": 0.82,
+  "timestamp": "2026-05-27T12:00:00Z",
+  "raw_payload": {},
+  "metadata": {}
+}
+```
+
+## Local Setup
+
+Requirements:
+
+- Python 3.11+
+- PowerShell on Windows
+- Git
+
+From the repo root:
+
+```powershell
+cd D:\Intellihub
+.\scripts\setup_local.ps1
+```
+
+If PowerShell blocks scripts:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\scripts\setup_local.ps1
+```
+
+The setup script:
+
+- creates `.venv`
+- installs dependencies
+- creates `local.settings.json` from `local.settings.sample.json` if needed
+
+## Local Configuration
+
+Local settings live in:
+
+- [local.settings.sample.json](local.settings.sample.json)
+- `local.settings.json`
+- `.env` file (alternative — see [.env.example](.env.example))
+
+Do not commit `local.settings.json` or `.env`. They may contain real Azure keys and webhook secrets.
+
+The app can run without Azure values by using in-memory fallback behavior. Add Azure values only when you want to test real Cosmos DB or Azure OpenAI integration.
+
+## Run Locally
+
+Start the API:
+
+```powershell
+.\scripts\run_local.ps1
+```
+
+The app runs at:
+
+```text
+http://127.0.0.1:8000
+```
+
+In a second PowerShell window, check health:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/healthz
+```
+
+Expected response:
+
+```json
+{"status":"ok"}
+```
+
+Stop the API with `Ctrl+C`.
+
+## Run Tests
+
+Run the full local test suite:
+
+```powershell
+.\scripts\test_all.ps1
+```
+
+This runs:
+
+- `pytest`
+- Python compile sanity check
+
+Current coverage includes:
+
+- GitHub webhook verification and mapping
+- Slack connector behavior
+- Linear connector behavior
+- Jira and Confluence connectors
+- Zendesk connector behavior
+- Meeting transcript upload
+- classification threshold behavior
+- semantic search and overlap detection
+- entity graph extraction
+- intelligence answers and timelines
+
+## Testing With Azure Values Locally
+
+After you create Azure resources, fill `local.settings.json` or `.env` with:
+
+```text
+COSMOS_ENDPOINT
+COSMOS_KEY
+COSMOS_DATABASE_NAME=closedloop-os
+COSMOS_CONTAINER_NAME=events
+AZURE_OPENAI_ENDPOINT
+AZURE_OPENAI_API_KEY
+AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-small
+AZURE_OPENAI_EMBEDDING_DIMENSIONS=1536
+AZURE_OPENAI_API_VERSION=2024-10-21
+```
+
+Then run:
+
+```powershell
+.\scripts\test_all.ps1
+.\scripts\run_local.ps1
+```
+
+## Azure Setup
+
+The only Azure resources needed are:
+
+- Azure Cosmos DB for NoSQL
+  - Database: `closedloop-os`
+  - Containers: `events` (partition key: `/source_tool`), `relationships` (partition key: `/relationship_type`), `knowledge` (partition key: `/source_tool`)
+- Azure OpenAI account and model deployments
+  - Chat model deployment (e.g. `gpt-4o-mini`)
+  - Embedding model deployment (e.g. `text-embedding-3-small`)
+
+No Azure Functions, Service Bus, AI Search, Key Vault, or Storage Account is needed.
+
+## Deployment
+
+The app is a standard FastAPI service that can be deployed anywhere:
+
+1. Create Cosmos DB and Azure OpenAI resources in Azure.
+2. Set environment variables (or `.env`) with the connection details.
+3. Run `python main.py` or deploy to any hosting platform (Docker, VM, App Service, etc.).
+4. Verify:
+
+```text
+http://your-host:8000/healthz
+```
+
+Expected response:
+
+```json
+{"status":"ok"}
+```
+
+## MCP Tools
+
+The MCP server exposes:
+
+- `query_github_events(project=None, actor=None, event_type=None, limit=25)`
+- `get_event_by_id(event_id)`
+- `search_decisions(query_text=None, limit=25)`
+- `get_slack_context(channel, thread_ts=None, user=None, limit=25)`
+- `get_linear_sprint_status(project=None, cycle=None, limit=25)`
+- `semantic_search(query_text, limit=10, source_tool=None)`
+- `get_jira_epic_status(epic_key=None, project=None, limit=25)`
+- `get_notion_decisions(query_text=None, limit=25)`
+- `analyze_meeting(meeting_id, limit=100)`
+- `get_customer_signals(limit=25)`
+- `get_entity_graph(entity, limit=50)`
+- `get_action_items(query_text=None, limit=25)`
+- `ask_intelligence(question)`
+- `get_timeline(entity, limit=50)
+
+## Example Questions
+
+Once events are ingested, the intelligence layer can answer questions like:
+
+```text
+What customer signals mention ENG-101?
+What decisions were made about semantic search?
+What action items came from the last standup?
+What is the timeline for ENG-101?
+Which Jira and Linear issues look duplicated?
+```
+
+`ask_intelligence(question)` returns:
+
+- `answer`
+- `confidence`
+- `trust_score`
+- `citations`
+- `uncited_claims`
+- `suggested_actions`
+- `processing_time_ms`
+
+The implementation is intentionally conservative: factual claims are built from retrieved internal sources and should include citations.
+
+## Repository Structure
+
+```text
+.
+|-- main.py
+|-- .env.example
+|-- local.settings.sample.json
+|-- pyproject.toml
+|-- scripts/
+|   |-- setup_local.ps1
+|   |-- run_local.ps1
+|   `-- test_all.ps1
+|-- src/
+|   `-- closedloop_os/
+`-- tests/
+```
+
+## Security Notes
+
+- Never commit `local.settings.json` or `.env`.
+- Rotate keys if they are accidentally shared.
+- All secrets are stored in environment variables or `.env` file — no Key Vault needed.
+- Connector tokens (Slack, Jira, etc.) must be created outside the app and injected through environment variables.
+
+## Current Limitations
+
+- Connector OAuth consent flows are not implemented in this service yet.
+- Jira, Confluence, Slack, Notion, and Zendesk tokens must be created outside the app and injected through environment variables.
+- In-memory vector search works well up to ~100K documents. Beyond that, consider adding a dedicated vector DB like Qdrant or Weaviate.
+
+## More Guides
+
+- [LOCAL_QUICKSTART.md](LOCAL_QUICKSTART.md): quickest local-first setup path.
+- [SETUP_RUN_AND_TEST.md](SETUP_RUN_AND_TEST.md): detailed local testing guide.
+- [plans/migration-plan.md](plans/migration-plan.md): migration plan from the old Azure-heavy architecture.
