@@ -79,8 +79,3 @@ Contributions are welcome! Please fork the repository and submit a pull request.
 
 MIT
 
-## Code Improvements Applied
-
-- Added regression tests for high-risk files: `Bi86ts-Team_GitForge-c2c428b8aa4203c26e42644f79bfc3632a1566cf/frontend/src/app/providers.tsx`, `frontend/src/app/providers.tsx`, `Bi86ts-Team_GitForge-c2c428b8aa4203c26e42644f79bfc3632a1566cf/backend/app/main.py`.
-- Proposed extraction of shared utility code into a dedicated module to reduce coupling.
-- Updated and regenerated documentation walkthroughs/diagrams post structural changes.
