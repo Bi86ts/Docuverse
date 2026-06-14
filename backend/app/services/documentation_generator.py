@@ -1,0 +1,414 @@
+"""
+Documentation Generator Service
+
+Generates structured, MNC-standard documentation for repository code files
+and folders using AWS Bedrock Nova models with tree-sitter AST context.
+"""
+
+import asyncio
+import hashlib
+import os
+import logging
+from typing import List, Dict, Any, Optional
+
+from app.config import get_settings
+from app.services.parser import ParserService, LANGUAGE_EXTENSIONS, TEXT_EXTENSIONS
+from app.services.bedrock_client import (
+    call_nova_micro,
+    call_nova_lite,
+    call_nova_pro,
+    BEDROCK_MAX_CONCURRENCY,
+)
+
+logger = logging.getLogger(__name__)
+
+# Files/folders to skip during documentation
+SKIP_DIRS = {
+    "node_modules", ".git", "__pycache__", ".next", "dist", "build",
+    ".venv", "venv", "env", ".env", ".idea", ".vscode", "coverage",
+    ".mypy_cache", ".pytest_cache", "egg-info",
+}
+SKIP_FILES = {
+    ".DS_Store", "Thumbs.db", ".gitignore", ".env", "package-lock.json",
+    "yarn.lock", "pnpm-lock.yaml", ".eslintcache",
+}
+# Non-source extensions to skip for per-file LLM documentation
+SKIP_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2",
+    ".ttf", ".eot", ".mp3", ".mp4", ".wav", ".webm", ".zip", ".tar",
+    ".gz", ".lock", ".map", ".min.js", ".min.css",
+}
+MAX_FILE_SIZE = 100_000  # 100KB max per file
+MAX_FILES = 60  # cap number of files sent to LLM
+
+
+class DocumentationGenerator:
+    """Generates structured documentation for an entire repository."""
+
+    def __init__(self):
+        self.parser = ParserService()
+        # Per-file cache: (repo_id, file_path, content_hash) -> doc dict
+        self._file_cache: Dict[str, Dict[str, Any]] = {}
+        self._semaphore = asyncio.Semaphore(BEDROCK_MAX_CONCURRENCY)
+
+    @staticmethod
+    def _classify_file_complexity(source: str, ast_nodes: list) -> str:
+        """Route files to the appropriate Nova model tier."""
+        line_count = source.count("\n") + 1
+        node_count = len(ast_nodes)
+        if line_count < 50 and node_count < 5:
+            return "simple"
+        if line_count > 200 or node_count > 30:
+            return "complex"
+        return "standard"
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def generate_repository_docs(self, repo_path: str) -> Dict[str, Any]:
+        """
+        Generate full documentation for a repository.
+
+        Returns a dict with:
+          - overview: str
+          - architecture: str
+          - folder_tree: str
+          - files: list[FileDocumentation]
+          - dependencies: str
+        """
+        logger.info("Generating repository documentation for %s", repo_path)
+
+        # 1. Walk the tree and collect file metadata
+        tree_str, file_paths = self._walk_tree(repo_path)
+
+        # 2. Generate per-file documentation IN PARALLEL (capped at CONCURRENCY)
+        async def _safe_doc(fpath: str) -> Optional[Dict[str, Any]]:
+            try:
+                return await self._document_file(repo_path, fpath)
+            except Exception as exc:
+                logger.warning("Skipping %s: %s", fpath, exc)
+                return None
+
+        results = await asyncio.gather(*[_safe_doc(fp) for fp in file_paths])
+        file_docs: List[Dict[str, Any]] = [d for d in results if d]
+
+        # 3. Build high-level summaries via LLM — all three in parallel
+        overview, architecture, dependencies = await asyncio.gather(
+            self._generate_overview(repo_path, tree_str, file_docs),
+            self._generate_architecture(tree_str, file_docs),
+            self._generate_dependencies(repo_path, file_docs),
+        )
+
+        return {
+            "overview": overview,
+            "architecture": architecture,
+            "folder_tree": tree_str,
+            "files": file_docs,
+            "dependencies": dependencies,
+        }
+
+    async def generate_file_docs(self, repo_path: str, file_path: str) -> Dict[str, Any]:
+        """Generate documentation for a single file (on-demand)."""
+        doc = await self._document_file(repo_path, file_path)
+        if not doc:
+            return {"path": file_path, "sections": [], "summary": "Could not parse file."}
+        return doc
+
+    # ------------------------------------------------------------------
+    # Tree walker
+    # ------------------------------------------------------------------
+
+    def _walk_tree(self, repo_path: str) -> tuple:
+        """Return (tree_string, list_of_relative_file_paths). Filters non-source files."""
+        lines: List[str] = []
+        file_paths: List[str] = []
+
+        def _recurse(directory: str, prefix: str = ""):
+            try:
+                entries = sorted(os.listdir(directory))
+            except PermissionError:
+                return
+
+            dirs = [e for e in entries if os.path.isdir(os.path.join(directory, e)) and e not in SKIP_DIRS]
+            files = [e for e in entries if os.path.isfile(os.path.join(directory, e)) and e not in SKIP_FILES]
+
+            for i, fname in enumerate(files):
+                connector = "├── " if (i < len(files) - 1 or dirs) else "└── "
+                lines.append(f"{prefix}{connector}{fname}")
+                ext = os.path.splitext(fname)[1].lower()
+                # Only queue source-code files for LLM documentation
+                if ext not in SKIP_EXTS:
+                    rel = os.path.relpath(os.path.join(directory, fname), repo_path).replace("\\", "/")
+                    file_paths.append(rel)
+
+            for i, dname in enumerate(dirs):
+                connector = "├── " if i < len(dirs) - 1 else "└── "
+                lines.append(f"{prefix}{connector}{dname}/")
+                extension = "│   " if i < len(dirs) - 1 else "    "
+                _recurse(os.path.join(directory, dname), prefix + extension)
+
+        _recurse(repo_path)
+        # Cap number of files to avoid excessive LLM calls
+        if len(file_paths) > MAX_FILES:
+            logger.info("Capping documentation to %d of %d files", MAX_FILES, len(file_paths))
+            file_paths = file_paths[:MAX_FILES]
+        return "\n".join(lines), file_paths
+
+    # ------------------------------------------------------------------
+    # Per-file documentation
+    # ------------------------------------------------------------------
+
+    async def _document_file(self, repo_path: str, rel_path: str) -> Optional[Dict[str, Any]]:
+        abs_path = os.path.join(repo_path, rel_path)
+        if not os.path.isfile(abs_path):
+            return None
+
+        size = os.path.getsize(abs_path)
+        if size > MAX_FILE_SIZE:
+            return {
+                "path": rel_path,
+                "language": self._detect_lang(rel_path),
+                "summary": "File too large for inline documentation.",
+                "sections": [],
+            }
+
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                source = f.read()
+        except Exception:
+            return None
+
+        if not source.strip():
+            return {
+                "path": rel_path,
+                "language": self._detect_lang(rel_path),
+                "summary": "Empty file.",
+                "sections": [],
+            }
+
+        # Check per-file cache by content hash
+        content_hash = hashlib.md5(source.encode("utf-8")).hexdigest()
+        cache_key = f"{repo_path}::{rel_path}::{content_hash}"
+        if cache_key in self._file_cache:
+            logger.debug("Cache hit for %s", rel_path)
+            return self._file_cache[cache_key]
+
+        # Attempt AST parse for richer context
+        lang = self._detect_lang(rel_path)
+        ast_nodes = []
+        if lang and lang not in {"text", "unknown"}:
+            try:
+                ext = os.path.splitext(rel_path)[1]
+                if ext in LANGUAGE_EXTENSIONS:
+                    ast_nodes = self.parser.parse_file(abs_path)
+            except Exception:
+                pass
+
+        sections = await self._build_file_sections(rel_path, source, lang, ast_nodes)
+        summary = sections[0]["content"] if sections else ""
+
+        result = {
+            "path": rel_path,
+            "language": lang,
+            "summary": summary,
+            "sections": sections,
+        }
+        self._file_cache[cache_key] = result
+        return result
+
+    async def _build_file_sections(
+        self, rel_path: str, source: str, lang: str, ast_nodes: list
+    ) -> List[Dict[str, str]]:
+        """Ask LLM to produce structured documentation sections for a file."""
+        # Build AST summary if available
+        ast_summary = ""
+        if ast_nodes:
+            parts = []
+            for node in ast_nodes[:40]:  # cap at 40 nodes
+                parts.append(f"- {node.node_type.value}: {node.name} (L{node.start_line}-{node.end_line})")
+            ast_summary = "\n".join(parts)
+
+        # Truncate very long files for the prompt
+        src_for_prompt = source[:12000] if len(source) > 12000 else source
+
+        prompt = f"""You are a senior software engineer writing internal documentation for an MNC.
+
+Produce structured documentation for the file **{rel_path}** ({lang or 'unknown'}).
+
+Rules:
+- Return ONLY markdown.
+- Start with a one-paragraph **Module Overview** (what this file does, why it exists).
+- Then a **Dependencies** section listing imports / external deps.
+- If there are classes, add a **Classes** section with a table: | Class | Purpose | Key Methods |
+- If there are functions, add a **Functions** section with a table: | Function | Parameters | Returns | Description |
+- If applicable, add **Configuration** or **Constants** section.
+- End with a **Notes / Edge Cases** section if relevant.
+- Be concise but thorough. Use professional tone.
+
+{("AST Structure:" + chr(10) + ast_summary) if ast_summary else ""}
+
+Source code:
+```{lang or ''}
+{src_for_prompt}
+```"""
+
+        system = "You are a documentation engineer. Output only markdown."
+        complexity = self._classify_file_complexity(source, ast_nodes)
+        try:
+            async with self._semaphore:
+                if complexity == "simple":
+                    text = await call_nova_micro(prompt, max_tokens=1500, temperature=0.2, system_prompt=system)
+                elif complexity == "complex":
+                    text = await call_nova_pro(prompt, max_tokens=1500, temperature=0.2, system_prompt=system)
+                else:
+                    text = await call_nova_lite(prompt, max_tokens=1500, temperature=0.2, system_prompt=system)
+            text = text.strip()
+        except Exception as exc:
+            logger.warning("Primary Bedrock call failed for %s (%s), falling back", rel_path, exc)
+            try:
+                async with self._semaphore:
+                    text = await call_nova_lite(prompt, max_tokens=1500, temperature=0.2, system_prompt=system)
+                text = text.strip()
+            except Exception as exc2:
+                logger.error("Fallback Bedrock call also failed for %s: %s", rel_path, exc2)
+                text = f"## Module Overview\n\nDocumentation generation failed: {exc2}"
+
+        # Split LLM markdown into sections by ## headings
+        return self._split_markdown_sections(text)
+
+    @staticmethod
+    def _split_markdown_sections(md: str) -> List[Dict[str, str]]:
+        sections: List[Dict[str, str]] = []
+        current_title = "Overview"
+        current_lines: List[str] = []
+
+        for line in md.split("\n"):
+            if line.startswith("## "):
+                if current_lines:
+                    sections.append({"title": current_title, "content": "\n".join(current_lines).strip()})
+                current_title = line.lstrip("# ").strip()
+                current_lines = []
+            else:
+                current_lines.append(line)
+
+        if current_lines:
+            sections.append({"title": current_title, "content": "\n".join(current_lines).strip()})
+
+        return sections
+
+    # ------------------------------------------------------------------
+    # High-level summaries
+    # ------------------------------------------------------------------
+
+    async def _generate_overview(
+        self, repo_path: str, tree_str: str, file_docs: List[Dict]
+    ) -> str:
+        repo_name = os.path.basename(repo_path)
+        file_summaries = "\n".join(
+            f"- **{d['path']}**: {d['summary'][:120]}" for d in file_docs[:40]
+        )
+        prompt = f"""Write a professional **Project Overview** (3-5 paragraphs) for the repository "{repo_name}".
+
+Folder structure:
+```
+{tree_str[:3000]}
+```
+
+File summaries:
+{file_summaries[:4000]}
+
+Include: purpose, tech stack, high-level architecture, and intended audience.
+Output only markdown (no title heading needed)."""
+
+        system = "You are a documentation engineer. Output only markdown."
+        try:
+            result = await call_nova_pro(prompt, max_tokens=2000, temperature=0.2, system_prompt=system)
+            return result.strip()
+        except Exception as exc:
+            logger.warning("Nova Pro overview failed (%s), falling back to Nova Lite", exc)
+            try:
+                result = await call_nova_lite(prompt, max_tokens=2000, temperature=0.2, system_prompt=system)
+                return result.strip()
+            except Exception as exc2:
+                logger.error("Overview generation failed: %s", exc2)
+                return f"Overview generation failed: {exc2}"
+
+    async def _generate_architecture(self, tree_str: str, file_docs: List[Dict]) -> str:
+        file_summaries = "\n".join(
+            f"- **{d['path']}**: {d['summary'][:100]}" for d in file_docs[:40]
+        )
+        prompt = f"""Based on this repository structure and file summaries, write an **Architecture** section.
+
+Structure:
+```
+{tree_str[:3000]}
+```
+
+Files:
+{file_summaries[:4000]}
+
+Cover: layers / modules, data flow, key design patterns, entry points.
+Output only markdown (no title heading needed)."""
+
+        system = "You are a documentation engineer. Output only markdown."
+        try:
+            result = await call_nova_pro(prompt, max_tokens=2000, temperature=0.2, system_prompt=system)
+            return result.strip()
+        except Exception as exc:
+            logger.warning("Nova Pro architecture failed (%s), falling back to Nova Lite", exc)
+            try:
+                result = await call_nova_lite(prompt, max_tokens=2000, temperature=0.2, system_prompt=system)
+                return result.strip()
+            except Exception as exc2:
+                logger.error("Architecture generation failed: %s", exc2)
+                return f"Architecture generation failed: {exc2}"
+
+    async def _generate_dependencies(self, repo_path: str, file_docs: List[Dict]) -> str:
+        # Try to read requirements.txt / package.json
+        dep_files = {}
+        for name in ("requirements.txt", "package.json", "pyproject.toml", "go.mod", "Cargo.toml"):
+            p = os.path.join(repo_path, name)
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        dep_files[name] = f.read()[:4000]
+                except Exception:
+                    pass
+
+        if not dep_files:
+            return "No dependency manifest found."
+
+        dep_text = "\n\n".join(f"**{k}**:\n```\n{v}\n```" for k, v in dep_files.items())
+        prompt = f"""Analyze these dependency files and write a **Dependencies** section.
+
+{dep_text}
+
+Include: major libraries with their purpose, version constraints, dev vs prod deps.
+Output only markdown (no title heading needed)."""
+
+        system = "You are a documentation engineer. Output only markdown."
+        try:
+            result = await call_nova_lite(prompt, max_tokens=2000, temperature=0.2, system_prompt=system)
+            return result.strip()
+        except Exception as exc:
+            logger.warning("Nova Lite dependencies failed (%s), falling back to Nova Micro", exc)
+            try:
+                result = await call_nova_micro(prompt, max_tokens=2000, temperature=0.2, system_prompt=system)
+                return result.strip()
+            except Exception as exc2:
+                logger.error("Dependencies generation failed: %s", exc2)
+                return f"Dependency analysis failed: {exc2}"
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_lang(rel_path: str) -> str:
+        ext = os.path.splitext(rel_path)[1].lower()
+        if ext in LANGUAGE_EXTENSIONS:
+            return LANGUAGE_EXTENSIONS[ext]
+        if ext in TEXT_EXTENSIONS:
+            return ext.lstrip(".")
+        return "unknown"

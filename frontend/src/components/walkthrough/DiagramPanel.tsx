@@ -1,0 +1,248 @@
+'use client'
+
+import { useEffect, useRef, useState } from 'react'
+import { motion } from 'framer-motion'
+import { 
+  RefreshCw, 
+  Download, 
+  Layers,
+  Loader2,
+  AlertCircle,
+  Maximize2,
+} from 'lucide-react'
+import { clsx } from 'clsx'
+import { diagrams } from '@/lib/api'
+import toast from 'react-hot-toast'
+
+interface DiagramPanelProps {
+  repositoryId: string
+  filePath: string
+  onExpand?: () => void
+}
+
+type DiagramType = 'flowchart' | 'classDiagram' | 'sequenceDiagram'
+
+const DIAGRAM_LABELS: Record<DiagramType, string> = {
+  flowchart: 'Flow',
+  classDiagram: 'Class',
+  sequenceDiagram: 'Sequence',
+}
+
+export function DiagramPanel({ repositoryId, filePath, onExpand }: DiagramPanelProps) {
+  const [diagramType, setDiagramType] = useState<DiagramType>('flowchart')
+  const [mermaidCode, setMermaidCode] = useState<string | null>(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const renderCountRef = useRef(0)
+
+  const generateDiagram = async () => {
+    if (!filePath) return
+    setIsLoading(true)
+    setError(null)
+    try {
+      const result = await diagrams.generate(repositoryId, diagramType, filePath)
+      setMermaidCode(result.mermaid_code)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to generate diagram')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  // Re-generate when type or file changes
+  useEffect(() => {
+    generateDiagram()
+    
+    // Cleanup function
+    return () => {
+      if (containerRef.current) {
+        containerRef.current.innerHTML = ''
+      }
+    }
+  }, [diagramType, filePath])
+
+  // Render mermaid when code changes
+  useEffect(() => {
+    if (!mermaidCode || !containerRef.current) return
+    renderMermaid(mermaidCode)
+  }, [mermaidCode])
+
+  // Re-render mermaid when theme changes
+  useEffect(() => {
+    const html = document.documentElement
+    const observer = new MutationObserver(() => {
+      if (mermaidCode) renderMermaid(mermaidCode)
+    })
+    observer.observe(html, { attributes: true, attributeFilter: ['class'] })
+    return () => observer.disconnect()
+  }, [mermaidCode])
+
+  const renderMermaid = async (code: string) => {
+    if (!containerRef.current) return
+    
+    // Clear previous content to prevent React conflicts
+    containerRef.current.innerHTML = ''
+
+    const isLight = document.documentElement.classList.contains('light')
+    
+    try {
+      const mermaid = (await import('mermaid')).default
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: isLight ? 'default' : 'dark',
+        securityLevel: 'loose',
+        flowchart: {
+          useMaxWidth: true,
+          htmlLabels: true,
+          curve: 'linear',
+        },
+        themeVariables: isLight
+          ? {
+              primaryColor: '#818cf8',
+              primaryTextColor: '#1c1917',
+              primaryBorderColor: '#d4d4d8',
+              lineColor: '#a1a1aa',
+              secondaryColor: '#f4f4f5',
+              tertiaryColor: '#fafafa',
+              background: '#ffffff',
+              mainBkg: '#f4f4f5',
+              nodeBorder: '#d4d4d8',
+              clusterBkg: '#f4f4f5',
+              titleColor: '#1c1917',
+              edgeLabelBackground: '#f4f4f5',
+            }
+          : {
+              primaryColor: '#6366f1',
+              primaryTextColor: '#e4e4e7',
+              primaryBorderColor: '#27272a',
+              lineColor: '#52525b',
+              secondaryColor: '#18181b',
+              tertiaryColor: '#0f0f11',
+              background: '#09090b',
+              mainBkg: '#18181b',
+              nodeBorder: '#27272a',
+              clusterBkg: '#18181b',
+              titleColor: '#e4e4e7',
+              edgeLabelBackground: '#18181b',
+            },
+      })
+
+      // Use unique ID for each render
+      renderCountRef.current += 1
+      const diagramId = `diagram-${renderCountRef.current}`
+      
+      const { svg } = await mermaid.render(diagramId, code)
+      
+      // Only update if component is still mounted
+      if (containerRef.current) {
+        containerRef.current.innerHTML = svg
+      }
+    } catch (err) {
+      console.error('Mermaid render error:', err)
+      console.error('Mermaid code that failed:', code)
+      if (containerRef.current) {
+        containerRef.current.innerHTML = `
+          <div class="flex flex-col items-center justify-center h-full text-dv-text-muted gap-2">
+            <p>Could not render diagram</p>
+            <p class="text-xs opacity-60">The file may not contain structures for this diagram type</p>
+          </div>
+        `
+      }
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleDownload = () => {
+    if (!containerRef.current) return
+    const svg = containerRef.current.querySelector('svg')
+    if (!svg) return
+    const svgData = new XMLSerializer().serializeToString(svg)
+    const blob = new Blob([svgData], { type: 'image/svg+xml' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `diagram-${diagramType}.svg`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  return (
+    <div className="h-full flex flex-col">
+      {/* Header */}
+      <div className="p-4 border-b border-dv-border-subtle">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="ios-caption1 font-medium flex items-center gap-2">
+            <Layers className="w-4 h-4 text-dv-purple" />
+            Diagrams
+          </h3>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={generateDiagram}
+              className="p-1.5 rounded-[8px] hover:bg-[var(--glass-6)] transition-colors active:scale-[0.92]"
+              disabled={isLoading}
+            >
+              <RefreshCw className={clsx('w-3.5 h-3.5 text-dv-text-muted', isLoading && 'animate-spin')} />
+            </button>
+            <button
+              onClick={handleDownload}
+              className="p-1.5 rounded-[8px] hover:bg-[var(--glass-6)] transition-colors active:scale-[0.92]"
+            >
+              <Download className="w-3.5 h-3.5 text-dv-text-muted" />
+            </button>
+            {onExpand && (
+              <button
+                onClick={onExpand}
+                className="p-1.5 rounded-[8px] hover:bg-[var(--glass-6)] transition-colors active:scale-[0.92]"
+                title="Expand"
+              >
+                <Maximize2 className="w-3.5 h-3.5 text-dv-text-muted" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Diagram type selector */}
+        <div className="ios-segmented">
+          {(Object.keys(DIAGRAM_LABELS) as DiagramType[]).map((type) => (
+            <button
+              key={type}
+              onClick={() => setDiagramType(type)}
+              className={clsx(
+                'ios-segmented-item',
+                diagramType === type && 'active'
+              )}
+            >
+              {DIAGRAM_LABELS[type]}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Diagram container */}
+      <div className="flex-1 overflow-auto p-4 relative">
+        {isLoading && (
+          <div className="absolute inset-0 flex items-center justify-center bg-dv-bg/80 backdrop-blur-sm z-10">
+            <div className="flex items-center gap-2 text-dv-text-muted ios-caption1">
+              <RefreshCw className="w-4 h-4 animate-spin" />
+              <span>Generating diagram...</span>
+            </div>
+          </div>
+        )}
+        <div
+          ref={containerRef}
+          className="min-h-[300px] flex items-start justify-center [&>svg]:max-w-full"
+        />
+      </div>
+
+      {/* Info */}
+      <div className="p-3 border-t border-dv-border-subtle">
+        <p className="ios-caption2 text-dv-text-muted">
+          AI-generated from code analysis · Mermaid.js
+        </p>
+      </div>
+    </div>
+  )
+}
+
