@@ -381,7 +381,7 @@ erDiagram
 
 <div align="center">
 
-**Built with ❤️ by Team Logorhythms![alt text](image.png)**
+**Built with ❤️ by Team Logorhythms!
 
 *Transforming the way developers understand code — one walkthrough at a time.*
 
